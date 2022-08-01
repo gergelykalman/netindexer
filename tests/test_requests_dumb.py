@@ -2,15 +2,19 @@ import sys
 import requests
 from datetime import datetime as dt, timedelta as td
 
-from .helper import filereader
+from .helper import FileReader
 
 
 def test_requests_dumb(urlgen, timeout):
     done, errors = 0, 0
     start = dt.now()
-    for url in urlgen:
+    while True:
+        urls = urlgen.get_batch(1)
+        if len(urls) == 0:
+            break
+
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(urls[0], timeout=timeout)
         except Exception as exc:
             # print("Error", exc)
             errors += 1
@@ -27,6 +31,6 @@ def test_requests_dumb(urlgen, timeout):
 
 
 if __name__ == "__main__":
-    fr = filereader(sys.argv[1])
+    fr = FileReader(sys.argv[1])
     timeout = int(sys.argv[2])
     test_requests_dumb(fr, timeout=timeout)

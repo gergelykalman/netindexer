@@ -4,14 +4,15 @@ import requests
 from datetime import datetime as dt, timedelta as td
 
 
-from .helper import filereader
+from .helper import FileReader
 
 
 def fetcher_main(url_list, timeout):
     sess = requests.Session()
     results = []
     done = 0
-    for url in url_list:
+    for url_raw in url_list:
+        url = url_raw.strip()
         try:
             r = sess.get(url, timeout=timeout)
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout):
@@ -38,17 +39,10 @@ def test_requests_processpool(urlgen, workers, req_per_worker, timeout):
             #       TO prevent this, change the while to if, that way every concurrent.futures.wait timeout seconds
             #       a new worker will spawn. However, if some terminate, then we will never rach `workers`...
             while len(futures) < workers and not urls_exhausted:
-                url_list = []
-                for i in range(req_per_worker):
-                    try:
-                        url = next(urlgen)
-                    except StopIteration:
-                        urls_exhausted = True
-                        break
-                    else:
-                        url_list.append(url)
+                url_list = urlgen.get_batch(req_per_worker)
 
                 if len(url_list) == 0:
+                    urls_exhausted = True
                     break
 
                 args = [url_list, timeout]
@@ -93,7 +87,7 @@ if __name__ == "__main__":
         print("Usage: ./{} url_list num_workers req_per_worker timeout_secs".format(sys.argv[0]))
         exit(-1)
 
-    fr = filereader(sys.argv[1])
+    fr = FileReader(sys.argv[1])
     num_workers = int(sys.argv[2])
     req_per_worker = int(sys.argv[3])
     timeout = int(sys.argv[4])
