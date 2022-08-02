@@ -20,7 +20,7 @@ class MyCurlException(Exception):
 # toggles
 ENABLED_ARES = True
 # ENABLED_ARES = False
-PRINT_ERRORS = True
+PRINT_ERRORS = False
 WORKERS_PRINT_LOG = False
 # end
 
@@ -33,6 +33,9 @@ USERAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 CONTENTBUFFERSIZE = 4 * 1024
 HEADERBUFFERSIZE = 1024
 LASTFILL_WAITTIME = 0.1
+
+# rate limits
+MAX_SPAWNS_PER_ITERATION = 3
 
 
 class _Handle:
@@ -72,10 +75,10 @@ class _Handle:
         self.handle.setopt(pycurl.MAXREDIRS, 20)
 
         # performance tuning
-        # self.handle.setopt(pycurl.IPRESOLVE, 1)
-        # self.handle.setopt(pycurl.FRESH_CONNECT, 1)
-        # self.handle.setopt(pycurl.FORBID_REUSE, 1)
-        # self.handle.setopt(pycurl.DNS_CACHE_TIMEOUT, 0)
+        self.handle.setopt(pycurl.IPRESOLVE, 1)
+        self.handle.setopt(pycurl.FRESH_CONNECT, 1)
+        self.handle.setopt(pycurl.FORBID_REUSE, 1)
+        self.handle.setopt(pycurl.DNS_CACHE_TIMEOUT, 0)
         self.handle.setopt(pycurl.BUFFERSIZE, CONTENTBUFFERSIZE)
 
         self.__buf = io.BytesIO()
@@ -83,33 +86,26 @@ class _Handle:
         self.__header_buf = io.BytesIO()
         self.__headersize_exceeded = False
 
-    def __header_write(self, buf):
-        # TODO: this is duplicated code with write()
-        if self.__headersize_exceeded:
-            return
+    def __do_write(self, buf, size_exceeded, maxsize, newdata):
+        # Returns size_exceeded, always!
+        if size_exceeded is True:
+            return size_exceeded
 
-        self.__buf.seek(0, os.SEEK_END)
-        length = self.__header_buf.tell()
+        buf.seek(0, os.SEEK_END)
+        length = buf.tell()
 
-        if length <= HEADERBUFFERSIZE:
-            self.__header_buf.write(buf)
-        else:
-            # print("Write header buffer size exceeded!" % length)
-            self.__headersize_exceeded = True
-
-    def __write(self, buf):
-        # only read first N bytes we have memory for
-        if self.__bufsize_exceeded:
-            return
-
-        self.__buf.seek(0, os.SEEK_END)
-        length = self.__buf.tell()
-
-        if length <= CONTENTBUFFERSIZE:
-            self.__buf.write(buf)
+        if length <= maxsize:
+            buf.write(newdata)
         else:
             # print("Write buffer size exceeded!" % length)
-            self.__bufsize_exceeded = True
+            return True
+        return False
+
+    def __header_write(self, buf):
+        self.__headersize_exceeded = self.__do_write(self.__header_buf, self.__headersize_exceeded, HEADERBUFFERSIZE, buf)
+
+    def __write(self, buf):
+        self.__bufsize_exceeded = self.__do_write(self.__buf, self.__bufsize_exceeded, CONTENTBUFFERSIZE, buf)
 
     def get_private_data(self):
         buf = self.__buf.getvalue()
@@ -194,7 +190,7 @@ class FastFetch:
                     handle = _Handle(url, self.__timeout, self.__connect_timeout, self.__read_interval)
                 except UnicodeEncodeError:
                     # TODO: handle this before _Handle is called!
-                    continue
+                    raise
 
             self.multi_handle.add_handle(handle.handle)
             self.handles_inprogress[handle.handle] = handle
@@ -223,21 +219,6 @@ class FastFetch:
             headers[k] = v
         return headers
 
-    def __process_html(self, html_buf, headers):
-        html = html_buf
-        for k, v in headers.items():
-            if k.lower() == "Content-Encoding":
-                if v.lower() == "gzip":
-                    # TODO: defer unzip to our caller, we don't want to send obscenely large amounts of data
-                    #       to our parent process
-                    #html = zlib.decompress(html_buf)
-                    html = html_buf
-                # TODO: put this back
-#                else:
-#                    raise MyCurlException("Unknown content type: {}".format(v))
-                break
-        return html
-
     def __handle_response(self, c, errno=None, errmsg=None):
         handle = self.handles_inprogress[c]
         headers, html, error = None, None, None
@@ -253,9 +234,10 @@ class FastFetch:
             # NOTE: ignore errmsg for now as it's harder to group
             error = "({})".format(errno)
 
+        # TODO: disabled for debugging
         if error is None:
             headers = self.__process_headers(headers_raw)
-            html = self.__process_html(html_raw, headers)
+            html = html_raw     # we return the raw bytes for now
 
         result = {
             "created": dt.now().isoformat(),
@@ -265,6 +247,8 @@ class FastFetch:
             "http_code": handle.handle.getinfo(pycurl.RESPONSE_CODE),
             "size": handle.handle.getinfo(pycurl.SIZE_DOWNLOAD),
             "speed": handle.handle.getinfo(pycurl.SPEED_DOWNLOAD),
+            "ip": handle.handle.getinfo(pycurl.PRIMARY_IP),
+            "port": handle.handle.getinfo(pycurl.PRIMARY_PORT),
             # TODO: return the actual redirects here!
             "redirects": handle.handle.getinfo(pycurl.REDIRECT_COUNT),
             "error": error
@@ -327,6 +311,9 @@ class FastFetch:
 
 # IMPORTANT: This needs to be a separate function as otherwise ProcessPoolExecutor won't work
 def fetcher_main(*args):
+    # be nice and prevent hogging more important processes like our scheduler or pdns
+    os.nice(19)
+
     f = FastFetch(*args)
     results = f.run()
     return results
@@ -361,7 +348,8 @@ class Indexer:
             futures = set()
             start_time = dt.now()
             while not urls_exhausted or len(futures) > 0:
-                while len(futures) < self.__max_processes:
+                spawned = 0
+                while len(futures) < self.__max_processes and spawned < MAX_SPAWNS_PER_ITERATION:
                     urls_exhausted, urls_to_crawl = self.__read_url_batch(self.__batchsize_per_process)
                     if len(urls_to_crawl) == 0:
                         break
@@ -379,6 +367,7 @@ class Indexer:
                     future = executor.submit(fetcher_main, *args)
                     self.__worker_id += 1
                     futures.add(future)
+                    spawned += 1
 
                 # wait for results and collect statistics
                 done, not_done = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -401,10 +390,6 @@ class Indexer:
                         urls_processed += 1
                         yield result
 
-                    # json.dump(results, self.__resultfile)
-                    # self.__resultfile.write("\n")
-                    # self.__resultfile.flush()
-
                 futures = not_done
 
                 # print statistics
@@ -422,12 +407,6 @@ class Indexer:
         print("{} requests took {:.2f} seconds, avg: {:.2f}, errors: {:.2f} %".format(
             urls_processed, delta, urls_processed / delta, errors/urls_processed*100
         ))
-
-
-def dummy_urlgen(url, n):
-    while True:
-       for i in range(n):
-            yield url
 
 
 if __name__ == "__main__":

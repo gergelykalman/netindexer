@@ -1,3 +1,4 @@
+import os
 import sys
 import concurrent.futures
 import requests
@@ -7,29 +8,39 @@ from datetime import datetime as dt, timedelta as td
 from .helper import FileReader
 
 
-def fetcher_main(url_list, timeout):
+READ_CHUNK_SIZE = 4096      # 4kb
+SPAWN_PERCENTAGE = .05      # no more than 5% workers spawned in one iteration
+
+
+def fetcher_main(url_list, timeout, connect_timeout):
+    # be nice and prevent hogging more important processes like our scheduler or pdns
+    os.nice(19)
+
     sess = requests.Session()
     results = []
+    status, html = None, ""
     done = 0
     for url_raw in url_list:
         url = url_raw.strip()
         try:
-            r = sess.get(url, timeout=timeout)
+            # TODO: put a limit here so that we don't try to fetch arbitrarily much data, for this we need to stream.
+            r = sess.get(url, timeout=(connect_timeout, timeout))
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout):
             result = (done, url, "timeout", 0)
         except Exception as exc:
             result = (done, url, "Exception", 0)
         else:
-            result = (done, url, r.status_code, len(r.text))
+            # TODO: html processing disabled for debugging
+            result = (done, url, r.status_code, 0) #len(r.text))
         results.append(result)
         done += 1
     return results
 
 
-def test_requests_processpool(urlgen, workers, req_per_worker, timeout):
+def test_requests_processpool(urlgen, max_workers, req_per_worker, timeout, connect_timeout):
     start = dt.now()
     urls_exhausted = False
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         start_time = dt.now()
         last_status = start_time
@@ -38,17 +49,21 @@ def test_requests_processpool(urlgen, workers, req_per_worker, timeout):
             # NOTE: Watch out, spawning a lot of workers at once will HAMMER the infrastructure!
             #       TO prevent this, change the while to if, that way every concurrent.futures.wait timeout seconds
             #       a new worker will spawn. However, if some terminate, then we will never rach `workers`...
-            while len(futures) < workers and not urls_exhausted:
+            workers_spawned = 0
+            # NOTE: We only spawn MAX_WORKERS_SPAWNED in one go, as with high numbers of workers the first ones can
+            #       start to timeout before we finish spawning everyone...
+            while len(futures) < max_workers and workers_spawned < max_workers * SPAWN_PERCENTAGE and not urls_exhausted:
                 url_list = urlgen.get_batch(req_per_worker)
 
                 if len(url_list) == 0:
                     urls_exhausted = True
                     break
 
-                args = [url_list, timeout]
+                args = [url_list, timeout, connect_timeout]
                 future = executor.submit(fetcher_main, *args)
                 futures.append(future)
                 urls_submitted += len(url_list)
+                workers_spawned += 1
 
             # wait for results and collect statistics
             done, not_done = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -72,8 +87,8 @@ def test_requests_processpool(urlgen, workers, req_per_worker, timeout):
             elapsed = (now - last_status).total_seconds()
             if elapsed > 1:
                 success_rate = successes/urls_processed*100 if urls_processed > 0 else 0
-                print("STATUS: processed: %s, successes: %s, errors: %s, lag: %.2f, avg req/s: %.2f/s, success rate: %.2f%%" % (
-                    urls_processed, successes, errors, elapsed, urls_processed/(now-start_time).total_seconds(), success_rate))
+                print("STATUS: workers: %.2f%%, processed: %s, successes: %s, errors: %s, lag: %.2f, avg req/s: %.2f/s, success rate: %.2f%%" % (
+                    len(futures)/max_workers*100, urls_processed, successes, errors, elapsed, urls_processed/(now-start_time).total_seconds(), success_rate))
                 last_status = now
     end = dt.now()
     delta = (end-start).total_seconds()
