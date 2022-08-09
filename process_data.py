@@ -1,19 +1,18 @@
 import sys
 import pickle
+import zlib
 import gzip
 import re
 import pprint
+import glob
 
 import concurrent.futures
 from datetime import datetime as dt, timedelta as td
 
 
-MAX_WORKERS = 4
-BATCH_SIZE = 100
-
 PERMITTED_FUNCTIONS = [
     "ip", "raw_html", "headers", "html", "generator", "server", "title", "links", "regexmatch", "scripts",
-    "poweredby", "hiddenwp", "phpinfo", "indexof"]
+    "poweredby", "hiddenwp", "phpinfo", "indexof", "adminpanel", "s3bucket", "max"]
 
 
 def process_html(headers, body):
@@ -25,11 +24,12 @@ def process_html(headers, body):
             if v == "gzip":
                 try:
                     html_bytes += gzip.decompress(body)
-                except (EOFError, gzip.BadGzipFile):
+                except (EOFError, gzip.BadGzipFile, zlib.error):
                     # bad gzip
                     return server, html
             else:
-                print("ERROR: Invalid encoding: {}".format(v), file=sys.stderr)
+                # NOTE: this happens fairly rarely so it's muted for now
+                # print("ERROR: Invalid encoding: {}".format(v), file=sys.stderr)
                 return server, html
 
             break
@@ -41,13 +41,29 @@ def process_html(headers, body):
     return server, html
 
 
-def process_object(results, function):
+def __load_pickled_objects(filename):
+    with gzip.open(filename, "rb") as f:
+        while True:
+            try:
+                # NOTE: This is very insecure, _NEVER_ unpickle() user-provided data!
+                results = pickle.load(f)
+            except EOFError:
+                break
+            else:
+                for r in results:
+                    yield r
+
+
+def process_object(filename, function):
     ret = ""
 
-
-
     counter = 0
-    for r in results:
+    for r in __load_pickled_objects(filename):
+        counter += 1
+
+        if r["http_code"] != 200:
+            continue
+
         server, html = process_html(r["headers"], r["html"])
         # print("{:50s} {:15s} {:10s} {:10s} {:20s}".format(r["url"], r["ip"], extra["server"], extra["title"], extra["generator"]))
 
@@ -75,11 +91,12 @@ def process_object(results, function):
             matches = re.findall(r'<meta name="generator" content="(?P<generator>.*?)" />', html,
                                  re.MULTILINE | re.IGNORECASE)
             if len(matches) > 0:
-                ret += "{}\t{}".format(matches, r["url"]) + "\n"
+                ret += "{}\t{}".format(matches[0], r["url"]) + "\n"
         elif function == "title":
             matches = re.findall(r'<title>(?P<title>.*?)</title>', html, re.MULTILINE | re.IGNORECASE)
             if len(matches) > 0:
-                ret += "{}\t{}".format(matches, r["url"]) + "\n"
+                title = matches[0]
+                ret += "{}\t{}".format(r["url"], title) + "\n"
         elif function == "links":
             matches = re.findall(r'href=["\'].*?["\']', html, re.IGNORECASE | re.MULTILINE)
             if len(matches) > 0:
@@ -106,58 +123,64 @@ def process_object(results, function):
                 if len(matches) > 0:
                     ret += "{}".format(r["url"]) + "\n"
                     ret += "\t" + "\n\t".join(set(matches)) + "\n"
+        elif function == "adminpanel":
+            matches = re.findall(r'<title>(?P<title>.*?)</title>', html, re.MULTILINE | re.IGNORECASE)
+            if len(matches) > 0:
+                title = matches[0]
+                matches2 = re.findall(r'.*?(admin|login).*?', title, re.IGNORECASE)
+                if len(matches2) > 0:
+                    ret += "{}\t{}".format(r["url"], title) + "\n"
+        elif function == "s3bucket":
+            matches = re.finditer('(https?://[^.]*?\.s3\.amazonaws\.com/|http?s://s3\.amazonaws\.com/[^/]*?/)', html, re.MULTILINE | re.IGNORECASE)
+            buckets = set()
+            for match in matches:
+                bucketname = match.groups()[0]
+                buckets.add(bucketname)
+            for bucketname in buckets:
+                ret += "{}\t{}".format(r["url"], bucketname) + "\n"
+        elif function == "max":
+            matches = re.findall(r'<title>(?P<title>.*?)</title>', html, re.MULTILINE | re.IGNORECASE)
+            if len(matches) > 0:
+                title = matches[0]
+                matches2 = re.findall(r"(phpmyadmin|phpldapadmin|tivoli|nas|san|sap|torrent|router|switch|webcam|scada|plc|nvr|storage|ipmi|firewall|grafana|prometheus|dashboard|kubernetes|swagger|jira|redmine|confluence|mantis|nagios|icinga)",
+                           title, re.IGNORECASE | re.MULTILINE)
+                if len(matches2) > 0:
+                    ret += r["url"] + "\t" + title + "\n"
         elif function == "regexmatch":
             matches = re.findall(r'/p\.php', html, re.IGNORECASE | re.MULTILINE)
             if len(matches) > 0:
                 ret += r["url"] + "\n"
 
-        counter += 1
-
     return counter, ret
 
 
-def read_data_file(datafilename):
-    with open(datafilename, "rb") as data:
-        while True:
-            # read objects one by one
-            try:
-                # NOTE: This is very insecure, _NEVER_ unpickle() user-provided data!
-                r = pickle.load(data)
-            except EOFError:
-                break
-            else:
-                yield r
+def main(datafileglob, functionname, max_workers):
+    files = glob.glob(datafileglob)
+    print("Loaded {} files".format(len(files)), file=sys.stderr)
+    files_submitted = 0
 
-
-def main(datafilename, functionname):
-    datareader = read_data_file(datafilename)
     total = 0
 
     # print(r["http_code"], r["size"], r["ip"], r["url"], r["headers"], len(r["html"]))
     exhausted = False
-    processed = 0
-    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    resultnum = 0
+    start = dt.now()
+    last_status, last_total = dt.now(), 0
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()
         while not exhausted or len(futures) > 0:
-            while not exhausted and len(futures) < MAX_WORKERS:
-                objs = []
-                while not exhausted and len(objs) < BATCH_SIZE:
-                    try:
-                        r = next(datareader)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    else:
-                        # skip unsuccessful ones
-                        processed += 1
-                        if r["http_code"] != 200:
-                            continue
-                        objs.append(r)
+            while not exhausted and len(futures) < max_workers:
+                if files_submitted >= len(files):
+                    exhausted = True
+                    break
 
-                if len(objs) > 0:
-                    args = [objs, functionname]
-                    future = executor.submit(process_object, *args)
-                    futures.add(future)
+                nextfile = files[files_submitted]
+
+                args = [nextfile, functionname]
+                future = executor.submit(process_object, *args)
+                futures.add(future)
+
+                files_submitted += 1
 
             # wait for results and collect statistics
             done, not_done = concurrent.futures.wait(futures, timeout=5,
@@ -168,18 +191,38 @@ def main(datafilename, functionname):
                 if len(result) > 0:
                     print(result, end="")
 
-                print("STATUS: {} {}".format(processed, total), file=sys.stderr)
-                total += resultnum
+            total += resultnum
+
+            # print status
+            now = dt.now()
+            delta = (now-last_status).total_seconds()
+            if delta > 1:
+                print("STATUS: {}/{}, speed: {:d}/s, avg speed: {:d}/s"
+                .format(
+                    files_submitted, len(files),
+                    int((total-last_total)/delta),
+                    int(total/(now-start).total_seconds())
+                ), file=sys.stderr)
+                last_status = now
+                last_total = total
+
+                sys.stderr.flush()
+                sys.stdout.flush()
 
             futures = not_done
 
-    #process_object(r, function)
-
 
 if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("Usage: ./process_data.py datafilename max_workers functionname")
+        exit(1)
+
     datafilename = sys.argv[1]
-    functionname = None if len(sys.argv) < 3 else sys.argv[2]
+    max_workers = int(sys.argv[2])
+    functionname = sys.argv[3]
+
     if functionname not in PERMITTED_FUNCTIONS:
         print("Invalid function: {}, should be one of: {}".format(functionname, PERMITTED_FUNCTIONS))
         exit(1)
-    main(datafilename, functionname)
+
+    main(datafilename, functionname, max_workers)

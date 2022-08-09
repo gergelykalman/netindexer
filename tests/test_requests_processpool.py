@@ -98,13 +98,14 @@ def test_requests_processpool(urlgen, max_workers, req_per_worker, timeout, conn
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: ./{} url_list num_workers req_per_worker timeout_secs".format(sys.argv[0]))
+    if len(sys.argv) < 5:
+        print("Usage: ./{} url_list num_workers req_per_worker timeout_secs connect_timeout_secs".format(sys.argv[0]))
         exit(-1)
 
     fr = FileReader(sys.argv[1])
     num_workers = int(sys.argv[2])
     req_per_worker = int(sys.argv[3])
     timeout = int(sys.argv[4])
-    for result in test_requests_processpool(fr, num_workers, req_per_worker, timeout):
+    connect_timeout = int(sys.argv[5])
+    for result in test_requests_processpool(fr, num_workers, req_per_worker, timeout, connect_timeout):
         pass
