@@ -8,9 +8,7 @@ from helpers.config import CrawlConfig
 from engines.engine_pycurl import PycurlEngine
 from engines.engine_requests_processpool import processpool_engine
 
-
-#OUTPUT_BATCH_SIZE = 100000  # 100k works out to about 300MB files...
-OUTPUT_BATCH_SIZE = 10 # 100k works out to about 300MB files...
+OUTPUT_BATCH_SIZE = 100000  # 100k works out to about 300MB files...
 
 LOG_ERRORS = True
 
