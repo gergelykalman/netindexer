@@ -1,3 +1,4 @@
+import argparse
 import sys
 import pickle
 import zlib
@@ -7,12 +8,16 @@ import pprint
 import glob
 
 import concurrent.futures
-from datetime import datetime as dt, timedelta as td
+
+from helpers.statcollector import StatCollector
+
+# TODO: Refactor this entire file so that it can be used as a Python module!
 
 
-PERMITTED_FUNCTIONS = [
-    "ip", "raw_html", "headers", "html", "generator", "server", "title", "links", "regexmatch", "scripts",
-    "poweredby", "hiddenwp", "phpinfo", "indexof", "adminpanel", "s3bucket", "max"]
+ALLOWED_FUNCTIONS = [
+    "error", "ip", "raw_html", "headers", "html", "generator", "server", "title", "links", "regexmatch", "scripts",
+    "poweredby", "hiddenwp", "phpinfo", "indexof", "adminpanel", "s3bucket", "max"
+]
 
 
 def process_html(headers, body):
@@ -54,12 +59,18 @@ def __load_pickled_objects(filename):
                     yield r
 
 
-def process_object(filename, function):
+# TODO: This function is a mess and should be refactored
+def process_object(filename, function, regexp):
     ret = ""
 
     counter = 0
     for r in __load_pickled_objects(filename):
         counter += 1
+
+        # This is a special case, in every other function we ignore the non 200 status codes!
+        if function == "error":
+            ret += "{}\t{}".format(r["error"], r["url"]) + "\n"
+            continue
 
         if r["http_code"] != 200:
             continue
@@ -147,25 +158,26 @@ def process_object(filename, function):
                 if len(matches2) > 0:
                     ret += r["url"] + "\t" + title + "\n"
         elif function == "regexmatch":
-            matches = re.findall(r'/p\.php', html, re.IGNORECASE | re.MULTILINE)
+            matches = re.findall(regexp, html, re.IGNORECASE | re.MULTILINE)
             if len(matches) > 0:
                 ret += r["url"] + "\n"
+                ret += str(matches) + "\n"
 
     return counter, ret
 
 
-def main(datafileglob, functionname, max_workers):
-    files = glob.glob(datafileglob)
+def main(fileglob, functionname, max_workers, regexp):
+    files = glob.glob(fileglob)
     print("Loaded {} files".format(len(files)), file=sys.stderr)
+
+    stats = StatCollector()
     files_submitted = 0
 
     total = 0
+    last_total = 0
 
-    # print(r["http_code"], r["size"], r["ip"], r["url"], r["headers"], len(r["html"]))
+    stats.start_clock()
     exhausted = False
-    resultnum = 0
-    start = dt.now()
-    last_status, last_total = dt.now(), 0
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = set()
         while not exhausted or len(futures) > 0:
@@ -176,11 +188,11 @@ def main(datafileglob, functionname, max_workers):
 
                 nextfile = files[files_submitted]
 
-                args = [nextfile, functionname]
+                args = [nextfile, functionname, regexp]
                 future = executor.submit(process_object, *args)
                 futures.add(future)
-
                 files_submitted += 1
+                stats.add_submitted()
 
             # wait for results and collect statistics
             done, not_done = concurrent.futures.wait(futures, timeout=5,
@@ -191,38 +203,43 @@ def main(datafileglob, functionname, max_workers):
                 if len(result) > 0:
                     print(result, end="")
 
-            total += resultnum
+                stats.add_processed(resultnum)
 
             # print status
-            now = dt.now()
-            delta = (now-last_status).total_seconds()
-            if delta > 1:
-                print("STATUS: {}/{}, speed: {:d}/s, avg speed: {:d}/s"
-                .format(
-                    files_submitted, len(files),
-                    int((total-last_total)/delta),
-                    int(total/(now-start).total_seconds())
-                ), file=sys.stderr)
-                last_status = now
+            shouldprint, now, delta = stats.should_print(1)
+            if shouldprint:
+                print(
+                    "STATUS: {}/{}, speed: {:d}/s, avg speed: {:d}/s".format(
+                        stats.submitted, len(files),
+                        int((total-last_total)/delta),
+                        int(total / (now - stats.start).total_seconds())
+                    ),
+                    file=sys.stderr,
+                )
                 last_total = total
 
                 sys.stderr.flush()
                 sys.stdout.flush()
 
             futures = not_done
+    stats.print_final()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: ./process_data.py datafilename max_workers functionname")
-        exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file-glob", type=str, required=True,
+                        help="Glob of the files containing the data to analyze: Example: '../datadir/datafiles_*'")
+    parser.add_argument("--max-workers", type=int, required=True,
+                        help="Number of workers to spawn")
+    parser.add_argument("--function", type=str, choices=ALLOWED_FUNCTIONS, required=True,
+                        help="Name of the function to use")
+    parser.add_argument("--regexp", type=str, required=False,
+                        help="A valid regular expression to match, only valid if function is 'regexmatch'")
+    args = parser.parse_args()
 
-    datafilename = sys.argv[1]
-    max_workers = int(sys.argv[2])
-    functionname = sys.argv[3]
+    fileglob = args.file_glob
+    max_workers = args.max_workers
+    functionname = args.function
+    regexp = args.regexp
 
-    if functionname not in PERMITTED_FUNCTIONS:
-        print("Invalid function: {}, should be one of: {}".format(functionname, PERMITTED_FUNCTIONS))
-        exit(1)
-
-    main(datafilename, functionname, max_workers)
+    main(fileglob, functionname, max_workers, regexp)

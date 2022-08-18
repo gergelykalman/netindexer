@@ -1,52 +1,40 @@
 import io
 import os
-import sys
-import zlib
 import concurrent.futures
-import resource
 import traceback
 import time
 from datetime import datetime as dt
 
 import pycurl
 
-
-from .helper import FileReader
+from helpers.filereader import FileReader
+from helpers.statcollector import StatCollector
 
 
 class MyCurlException(Exception):
     pass
 
-# toggles
-ENABLED_ARES = True
-# ENABLED_ARES = False
-PRINT_ERRORS = False
-WORKERS_PRINT_LOG = False
-# end
 
-NSSERVER = "127.0.0.1"
 HEADERS = [
     "Accept: text/html,application/xhtml+xml,application/xml",
     "Accept-Encoding: gzip",
 ]
-USERAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36"
-CONTENTBUFFERSIZE = 4 * 1024
-HEADERBUFFERSIZE = 1024
-LASTFILL_WAITTIME = 0.1
-
-# rate limits
-MAX_SPAWNS_PER_ITERATION = 3
 
 
 class _Handle:
-    def __init__(self, url, timeout, connect_timeout, read_interval, nsserver=NSSERVER):
+    def __init__(self, url, config):
         self.__url = url
-        self.__nsserver = nsserver
+        self.__config = config
+
+        self.__nsserver = config.nsserver
+        self.__useragent = config.useragent
+        self.__contentbuffersize = config.pycurl_contentbuffersize
+        self.__headerbuffersize = config.pycurl_headerbuffersize
+        self.__enabled_ares = config.pycurl_enabled_ares
 
         # NOTE: Connection timeout is set to timeout for now
-        self.__timeout = timeout
-        self.__connect_timeout = connect_timeout
-        self.__read_interval = read_interval
+        self.__timeout = config.timeout
+        self.__connect_timeout = config.connect_timeout
 
         # local vars
         self.handle = pycurl.Curl()
@@ -62,10 +50,11 @@ class _Handle:
         self.handle.reset()
 
         # NOTE: Needs c-ares
-        if ENABLED_ARES:
+        if self.__enabled_ares:
             self.handle.setopt(pycurl.DNS_SERVERS, self.__nsserver)
         self.handle.setopt(pycurl.URL, self.__url)
-        self.handle.setopt(pycurl.USERAGENT, USERAGENT)
+        if self.__useragent is not None:
+            self.handle.setopt(pycurl.USERAGENT, self.__useragent)
         self.handle.setopt(pycurl.HTTPHEADER, HEADERS)
         self.handle.setopt(pycurl.WRITEFUNCTION, self.__write)
         self.handle.setopt(pycurl.HEADERFUNCTION, self.__header_write)
@@ -79,7 +68,7 @@ class _Handle:
         self.handle.setopt(pycurl.FRESH_CONNECT, 1)
         self.handle.setopt(pycurl.FORBID_REUSE, 1)
         self.handle.setopt(pycurl.DNS_CACHE_TIMEOUT, 0)
-        self.handle.setopt(pycurl.BUFFERSIZE, CONTENTBUFFERSIZE)
+        self.handle.setopt(pycurl.BUFFERSIZE, self.__contentbuffersize)
 
         self.__buf = io.BytesIO()
         self.__bufsize_exceeded = False
@@ -97,15 +86,15 @@ class _Handle:
         if length <= maxsize:
             buf.write(newdata)
         else:
-            # print("Write buffer size exceeded!" % length)
+            print("Write buffer size exceeded!" % length)
             return True
         return False
 
     def __header_write(self, buf):
-        self.__headersize_exceeded = self.__do_write(self.__header_buf, self.__headersize_exceeded, HEADERBUFFERSIZE, buf)
+        self.__headersize_exceeded = self.__do_write(self.__header_buf, self.__headersize_exceeded, self.__headerbuffersize, buf)
 
     def __write(self, buf):
-        self.__bufsize_exceeded = self.__do_write(self.__buf, self.__bufsize_exceeded, CONTENTBUFFERSIZE, buf)
+        self.__bufsize_exceeded = self.__do_write(self.__buf, self.__bufsize_exceeded, self.__contentbuffersize, buf)
 
     def get_private_data(self):
         buf = self.__buf.getvalue()
@@ -114,26 +103,26 @@ class _Handle:
 
 
 class FastFetch:
-    def __init__(self, name, maxhandles, urls_to_crawl, print_enabled, timeout, connect_timeout, read_interval):
+    def __init__(self, name, urls_to_crawl, config):
         self.name = name
-        self.__timeout = timeout
-        self.__connect_timeout = connect_timeout
-        self.__read_interval = read_interval
-
         self.urls_to_crawl = urls_to_crawl
+
+        self.__config = config
+
+        self.__read_interval = config.pycurl_read_interval_ms
+        self.__print_enabled = config.pycurl_workers_print_log
+        self.__maxhandles = config.pycurl_maxhandles
+        self.__lastfill_waittime = config.pycurl_lastfill_waittime
+        self.__enabled_ares = config.pycurl_enabled_ares
+
         self.__url_idx = 0
-
-        # this is here so we can test this object with vanilla file objects
-        self.print_enabled = print_enabled
-
-        self.maxhandles = maxhandles
 
         self.success = 0
         self.failure = 0
         self.results = []
         self.skipped = 0
 
-        if 1000000 < self.maxhandles < 1:
+        if 1000000 < self.__maxhandles < 1:
             raise ValueError("maxhandles is outside the range 0..1000000")
 
         self.__check_for_features()
@@ -152,7 +141,7 @@ class FastFetch:
     def __check_for_features(self):
         # check for libcurl features
         versiondata = pycurl.version
-        if ENABLED_ARES:
+        if self.__enabled_ares:
             if "c-ares" not in versiondata:
                 print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                 print("! WARNING c-ares support is not built in! !")
@@ -171,7 +160,7 @@ class FastFetch:
         return handle
 
     def __fillhandles(self):
-        free_handles = self.maxhandles - len(self.handles_inprogress)
+        free_handles = self.__maxhandles - len(self.handles_inprogress)
 
         # we use the file instead of a queue
         urls = self.urls_to_crawl[self.__url_idx:self.__url_idx+free_handles]
@@ -187,7 +176,7 @@ class FastFetch:
                 handle = self.handles_free.pop()
             else:
                 try:
-                    handle = _Handle(url, self.__timeout, self.__connect_timeout, self.__read_interval)
+                    handle = _Handle(url, self.__config)
                 except UnicodeEncodeError:
                     # TODO: handle this before _Handle is called!
                     raise
@@ -198,7 +187,7 @@ class FastFetch:
     def __print_status(self):
         now = dt.now()
         if (dt.now() - self.last_status).total_seconds() > 1:
-            if self.print_enabled and self.num_processed > 0:
+            if self.__print_enabled and self.num_processed > 0:
                 print("%s STATUS handles: %d, processed: %d, requests: %d/s, avg r/s: %d/s, good: %d, bad: %d, success rate: %.2f%%, lag: %.2f" % (
                     self.name, len(self.handles_inprogress), self.num_processed, self.num_processed - self.last_num_processed,
                     self.num_processed / ((dt.now()-self.start_time).total_seconds()),
@@ -230,11 +219,10 @@ class FastFetch:
             self.success += 1
         else:
             self.failure += 1
-            # error = "({} - {})".format(errno, errmsg)
+            error = "({} - {})".format(errno, errmsg)
             # NOTE: ignore errmsg for now as it's harder to group
-            error = "({})".format(errno)
+            # error = "({})".format(errno)
 
-        # TODO: disabled for debugging
         if error is None:
             headers = self.__process_headers(headers_raw)
             html = html_raw     # we return the raw bytes for now
@@ -298,7 +286,8 @@ class FastFetch:
 
                 self.__print_status()
 
-                if len(self.handles_inprogress) < self.maxhandles * .9 and (now - self.lastfill).total_seconds() > LASTFILL_WAITTIME:
+                if len(self.handles_inprogress) < self.__maxhandles * .9\
+                and (now - self.lastfill).total_seconds() > self.__lastfill_waittime:
                     self.__fillhandles()
                     self.lastfill = now
         except Exception as exc:
@@ -306,32 +295,31 @@ class FastFetch:
             print(traceback.format_exc())
             return MyCurlException("???")
         else:
-           return self.results
+            return self.results
 
 
 # IMPORTANT: This needs to be a separate function as otherwise ProcessPoolExecutor won't work
-def fetcher_main(*args):
+def fetcher_main(id, urls, config):
     # be nice and prevent hogging more important processes like our scheduler or pdns
     os.nice(19)
 
-    f = FastFetch(*args)
+    f = FastFetch(id, urls, config)
     results = f.run()
     return results
 
 
-class Indexer:
-    def __init__(self, url_generator, num_workers, max_handles, req_per_worker, timeout, connect_timeout, read_interval):
-        self.__url_generator = url_generator
-        self.__max_processes = num_workers
-        self.__max_handles = max_handles
-        self.__batchsize_per_process = req_per_worker
-        self.__timeout = timeout
-        self.__connect_timeout = connect_timeout
-        self.__read_interval = read_interval
+class PycurlEngine:
+    def __init__(self, config):
+        self.__config = config
+
+        self.__url_generator = FileReader(config.urlfile)
+        self.__max_processes = config.workers
+        self.__batchsize_per_process = config.batchsize
+        self.__max_spawns_per_iteration = config.pycurl_max_spawns_per_iteration
 
         self.__worker_id = 0
-        self.__last_status = dt.now()
-        self.__errortypes = {}
+
+        self.__stats = StatCollector()
 
     def __read_url_batch(self, batchsize):
         exhausted = False
@@ -341,15 +329,13 @@ class Indexer:
         return exhausted, batch
 
     def run_forever(self):
-        start = dt.now()
-        urls_processed, successes, errors = 0, 0, 0
+        self.__stats.start_clock()
         urls_exhausted = False
         with concurrent.futures.ProcessPoolExecutor(max_workers=self.__max_processes) as executor:
             futures = set()
-            start_time = dt.now()
             while not urls_exhausted or len(futures) > 0:
                 spawned = 0
-                while len(futures) < self.__max_processes and spawned < MAX_SPAWNS_PER_ITERATION:
+                while len(futures) < self.__max_processes and spawned < self.__max_spawns_per_iteration:
                     urls_exhausted, urls_to_crawl = self.__read_url_batch(self.__batchsize_per_process)
                     if len(urls_to_crawl) == 0:
                         break
@@ -357,12 +343,8 @@ class Indexer:
                     # print("Spawning task %s" % self.__worker_id)
                     args = [
                         "test_%s" % self.__worker_id,
-                        self.__max_handles,
                         urls_to_crawl,
-                        WORKERS_PRINT_LOG,
-                        self.__timeout,
-                        self.__connect_timeout,
-                        self.__read_interval,
+                        self.__config,
                     ]
                     future = executor.submit(fetcher_main, *args)
                     self.__worker_id += 1
@@ -379,59 +361,16 @@ class Indexer:
                     for result in results:
                         # record statistics
                         if result["error"] is None:
-                            successes += 1
+                            self.__stats.add_success()
                         else:
-                            #print("ERROR", result["error"])
-                            errors += 1
+                            print("ERROR", result["error"])
                             errormsg = result["error"]
-                            if self.__errortypes.get(errormsg) is None:
-                                self.__errortypes[errormsg] = 0
-                            self.__errortypes[errormsg] += 1
-                        urls_processed += 1
+                            self.__stats.add_error(errormsg)
+                        self.__stats.add_processed()
                         yield result
 
                 futures = not_done
 
-                # print statistics
-                now = dt.now()
-                elapsed = (now - self.__last_status).total_seconds()
-                if elapsed > 1:
-                    success_rate = successes/urls_processed*100 if urls_processed > 0 else 0
-                    print("STATUS: workers: %d, processed: %s, successes: %s, errors: %s, lag: %.2f, avg req/s: %.2f/s, success rate: %.2f%%" % (
-                        len(futures), urls_processed, successes, errors, elapsed, urls_processed/(now-start_time).total_seconds(), success_rate))
-                    if PRINT_ERRORS:
-                        print("ERRORS:", self.__errortypes)
-                    self.__last_status = now
-        end = dt.now()
-        delta = (end - start).total_seconds()
-        print("{} requests took {:.2f} seconds, avg: {:.2f}, errors: {:.2f} %".format(
-            urls_processed, delta, urls_processed / delta, errors/urls_processed*100
-        ))
+                self.__stats.print_periodic(len(futures), interval=1)
 
-
-if __name__ == "__main__":
-    if len(sys.argv) < 8:
-        print("Usage: ./{} url_list num_workers req_per_worker max_handles timeout_secs connect_timeout read_interval_ms".format(
-            sys.argv[0]))
-        exit(-1)
-
-    fr = FileReader(sys.argv[1])
-    num_workers = int(sys.argv[2])
-    req_per_worker = int(sys.argv[3])
-    max_handles = int(sys.argv[4])
-    timeout = int(sys.argv[5])
-    connect_timeout = int(sys.argv[6])
-
-    # read_interval:
-    #   Very important, this is the time we wait between reads. Too small and you get cpu bound, too little
-    #   and buffer is not read often enough to maximize speed. This should be adaptable, based on current conditions,
-    #   but I'm lazy to write that code right now.
-    #   Values: 1-100 usually work best, if you don't want to test too much, just use 10
-    read_interval = int(sys.argv[7]) / 1000
-
-    limit = (1000000, 1000000)
-    resource.setrlimit(resource.RLIMIT_NOFILE, limit)
-
-    indexer = Indexer(fr, num_workers, max_handles, req_per_worker, timeout, connect_timeout, read_interval)
-    for result in indexer.run_forever():
-        pass
+        self.__stats.print_final()

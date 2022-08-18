@@ -1,8 +1,8 @@
 import sys
 import requests
-from datetime import datetime as dt, timedelta as td
+from datetime import datetime as dt
 
-from .helper import FileReader
+from helpers.filereader import FileReader
 
 
 def test_requests_dumb(urlgen, timeout):
